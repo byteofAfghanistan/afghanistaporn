@@ -1,0 +1,294 @@
+                                                                                
+from __future__ import annotations
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import stat
+import subprocess
+import urllib.request
+import zipfile
+
+ROOT=Path(__file__).resolve().parents[1]
+SOURCES=tuple('tools/'+name for name in (
+    'Zula-Start.ps1','Zula-Launcher.ps1','Zula-LaunchArguments.ps1','Zula-ProcessTools.ps1',
+    'Set-ZulaHosts.ps1','Restore-ZulaHosts.ps1','Zula-HostsTools.ps1',
+    'check_remote_zula_ready.js','frida_play_connect.py',
+    'install_source_art.py','install_source_textures.py','source_texture_consumer_guard.py','wrs4_archive.py',
+    'remote_client_route.py','native_tls_pin.py','emulator_launch.py','emulator_pose_patch.py','client_capability_lease.py','client_enrollment.py',
+    'client_health.py','anet_connection_diagnostics.py','frida_anet_diagnostics.js',
+    'frida_remote_url.js','frida_remote_tls.js','frida_market_sort.js','frida_market_scroll.js',
+    'frida_card_refresh.js','frida_escort_pose.js','frida_startup_request_audit.js','frida_schema_probe.py'))+(
+    'certs/server.crt',
+    'extracted/archive/lang_en/visible_card.pak.json',
+    'extracted/archive/files_v0/sil_carddata_file0.pak.json',
+    'extracted/archive/files_v0/sil_carddata_file1.pak.json',
+    'extracted/archive/files_v0/sil_carddata_file2.pak.json',
+    'extracted/archive/files_v0/sil_texture_file.pak.json','extracted/weapon_default_cards.json')
+MAPPED={'resources/elite_texture_recovery.json':'resources/elite_texture_recovery.json',
+        'resources/escort_client_patch.json':'resources/escort_client_patch.json',
+        'README.md':'README.md'}
+COMPILER_INPUTS=('loader/Program.cs','loader/LauncherForm.cs','loader/LauncherBridge.cs','loader/AssemblyInfo.cs',
+                 'loader/app.manifest','loader/zula.ico','installer/TestClientBootstrap.cs','installer/ZulaTest.iss',
+                 'installer/runtime_sources.json','tools/build_test_installer.py','installer/ClientPrerequisites.cs','installer/prerequisites.json',
+                 'loader/AutoUpdate.cs','loader/UpdateTrust.cs','loader/UpdateTransaction.cs','loader/UpdateShortcuts.cs')
+LOADER_SOURCES=COMPILER_INPUTS[:4]+('installer/TestClientBootstrap.cs','installer/ClientPrerequisites.cs',
+                                'loader/AutoUpdate.cs','loader/UpdateTrust.cs','loader/UpdateTransaction.cs','loader/UpdateShortcuts.cs')
+PYTHON_FILES=('python.exe','pythonw.exe','python313.dll','python3.dll','vcruntime140.dll','vcruntime140_1.dll','LICENSE.txt',
+    'pyexpat.pyd','select.pyd','unicodedata.pyd','winsound.pyd','_asyncio.pyd','_bz2.pyd','_ctypes.pyd','_decimal.pyd',
+    '_elementtree.pyd','_hashlib.pyd','_lzma.pyd','_multiprocessing.pyd','_overlapped.pyd','_queue.pyd','_socket.pyd',
+    '_sqlite3.pyd','_ssl.pyd','_uuid.pyd','_wmi.pyd','_zoneinfo.pyd','libcrypto-3.dll','libffi-8.dll','libssl-3.dll',
+    'sqlite3.dll','python313.zip','python313._pth','python.cat')
+FRIDA_FILES=('frida/__init__.py','frida/_frida.pyd','frida/core.py','frida/py.typed','frida/_frida/__init__.pyi',
+    'frida/_frida/py.typed','frida-17.11.0.dist-info/licenses/COPYING','frida-17.11.0.dist-info/METADATA',
+    'frida-17.11.0.dist-info/WHEEL','frida-17.11.0.dist-info/top_level.txt','frida-17.11.0.dist-info/RECORD')
+MAX_FILE=150*1024*1024
+DEFAULT_GAME=ROOT/'Game'
+ANET_VENDOR_KEY_SHA256='b5622ebd367686dfb54b2612eeeb07a14054dfaff06ce6ee5b3c798beb64a294'
+CLIENT_LAYOUT_MIGRATION={'version':1,'retire':[
+    {'path':'server/escort_client_patch.json','sha256':['4c4da56351a9562a9cdcebefa54833eeba897e6858f1f6700e474463c5dcd505']},
+    {'path':'tools/check_zula_ready.js','sha256':['b876022c36e114a246e25c5a273a7059a6d1c58013791f5faf7b1e9200776e01']}]}
+
+def validate_client_paths(names):
+    for name in names:
+        safe_name(name)
+        if name in ('Zula-Loader.exe','README.md'):continue
+        if name=='tools/check_zula_ready.js' or not name.startswith(('Game/','runtime/','tools/','resources/','extracted/','certs/')):
+            raise ValueError('Non-client path in distribution')
+
+def public_client_manifest(document):
+                                                                                    
+    fields=('version','kind','platform','includesGame','distributionLayout','entryPoint','files','totalBytes',
+            'automaticUpdate','clientLayoutMigration')
+    return {key:document[key] for key in fields if key in document}
+
+def signed_client_payload(feed_directory):
+                                                                          
+    import publish_client_update as publisher
+    from check_client_update_feed import public_key
+    feed_directory=Path(feed_directory).resolve(strict=True)
+    raw=read(source_file(feed_directory,'stable.json'),publisher.MAX_ENVELOPE)
+    release=publisher.verify_envelope(raw,public_key())
+    selected={row['path']:row for row in release['files']}
+    result={}
+    for name in ('Zula-Loader.exe','client-payload-manifest.json'):
+        row=selected[name];content=read(source_file(feed_directory,'blobs/'+row['sha256']))
+        if len(content)!=row['size'] or sha(content)!=row['sha256']:raise ValueError('Signed client input changed')
+        result[name]=content
+    installed=publisher.strict_json(result['client-payload-manifest.json'])
+    publisher.validate_rows(installed.get('files'))
+    if installed!=public_client_manifest(installed):raise ValueError('Maintainer metadata in installed manifest')
+    if installed.get('automaticUpdate',{}).get('sequence')!=release['sequence']:raise ValueError('Client sequence mismatch')
+    return result
+
+def sha(raw):return hashlib.sha256(raw).hexdigest()
+def safe_name(name):
+    if not isinstance(name,str) or any(c in name for c in '\\:\";') or any(ord(c)<32 for c in name):raise ValueError('Unsafe payload name')
+    parts=name.split('/')
+    if any(x in ('','.','..') or x.endswith((' ','.')) for x in parts):raise ValueError('Unsafe payload path')
+    return name
+def ordinary(path):
+    info=path.lstat()
+    if not stat.S_ISREG(info.st_mode) or getattr(info,'st_file_attributes',0)&0x400:raise ValueError('Source must be an ordinary file')
+    return info
+def read(path,limit=MAX_FILE):
+    initial=ordinary(path)
+    if initial.st_size>limit:raise ValueError('Source exceeds byte bound')
+    with path.open('rb') as file:
+        raw=file.read(limit+1)
+        if len(raw)>limit or len(raw)!=initial.st_size:raise ValueError('Source changed or exceeds bound')
+    final=ordinary(path)
+    if (initial.st_ino,initial.st_mtime_ns,initial.st_size)!=(final.st_ino,final.st_mtime_ns,final.st_size):raise ValueError('Source changed')
+    return raw
+def source_file(root,name):
+    safe_name(name);path=root
+    for part in name.split('/'):
+        path=path/part
+        if path.is_symlink() or getattr(path.lstat(),'st_file_attributes',0)&0x400:raise ValueError('Source path contains a link')
+    return path
+def archive_members(raw,selected,*,exact=False):
+    with zipfile.ZipFile(__import__('io').BytesIO(raw)) as archive:
+        names=archive.namelist()
+        if len(names)!=len(set(names)) or len({n.casefold() for n in names})!=len(names):raise ValueError('Ambiguous archive members')
+        for name in names:
+            safe_name(name.rstrip('/'))
+        if exact and set(names)!=set(selected):raise ValueError('Runtime archive member list changed')
+        result={}
+        for name in selected:
+            info=archive.getinfo(name)
+            if info.file_size>MAX_FILE or stat.S_ISLNK(info.external_attr>>16):raise ValueError('Unsupported runtime member')
+            result[name]=archive.read(info)
+        return result
+def runtime_package(row,cache,fetch=False):
+    file=cache/row['file'];safe_name(row['file'])
+    if not file.exists():
+        if not fetch:raise ValueError('Pinned runtime is absent: '+row['file'])
+        if not row['url'].startswith(('https://nodejs.org/','https://www.python.org/','https://files.pythonhosted.org/','https://download.microsoft.com/')):raise ValueError('Unsupported runtime origin')
+        with urllib.request.urlopen(row['url'],timeout=60) as response:raw=response.read(row['size']+1)
+        if len(raw)!=row['size'] or sha(raw)!=row['sha256']:raise ValueError('Downloaded runtime failed its pin')
+        cache.mkdir(parents=True,exist_ok=True)
+        with file.open('xb') as output:output.write(raw)
+    raw=read(file)
+    if len(raw)!=row['size'] or sha(raw)!=row['sha256']:raise ValueError('Runtime pin mismatch: '+row['file'])
+    return raw
+def payload_sources(root):
+    result={name:read(source_file(root,name)) for name in SOURCES}
+    for source,dest in MAPPED.items():result[dest]=read(source_file(root,source))
+    validate_client_paths(result)
+    certificate=result['certs/server.crt']
+    if certificate.count(b'-----BEGIN CERTIFICATE-----')!=1 or b'PRIVATE KEY' in certificate:raise ValueError('Only a public certificate may be shipped')
+    for name,raw in result.items():
+        if name.startswith(('data/','logs/')) or name.endswith(('.key','.pem')):raise ValueError('Private path in payload')
+        if b'IDENTITY_FILE_REQUIRED_DO_NOT_USE_AS_A_TOKEN' in raw or b'-----BEGIN PRIVATE KEY-----' in raw or b'-----BEGIN OPENSSH PRIVATE KEY-----' in raw:raise ValueError('Credential material in payload')
+    guard=json.loads(result['resources/elite_texture_recovery.json'])
+    for record in guard['sourceGuards']['publicationInputs']:
+        if record['file'] not in result or sha(result[record['file']])!=record['sha256']:raise ValueError('Source art dependency not pinned')
+    return result
+def emit_files(payload,output):
+    rows=[]
+    for name in sorted(payload):
+        safe_name(name);file=output/name;file.parent.mkdir(parents=True,exist_ok=True)
+        with file.open('xb') as stream:stream.write(payload[name])
+        rows.append({'path':name,'size':len(payload[name]),'sha256':sha(payload[name])})
+    return rows
+def compile_loader(root,payload):
+    compiler=Path(os.environ['WINDIR'])/'Microsoft.NET/Framework64/v4.0.30319/csc.exe'
+    base=[str(compiler),'/nologo','/target:winexe','/platform:anycpu','/optimize+','/utf8output','/codepage:65001','/warnaserror+',
+        '/reference:System.dll','/reference:System.Core.dll','/reference:System.Drawing.dll','/reference:System.Windows.Forms.dll',
+        '/reference:System.Web.Extensions.dll','/win32icon:'+str(root/'loader/zula.ico'),'/win32manifest:'+str(root/'loader/app.manifest')]
+    subprocess.run(base+['/main:ZulaLoader.Program','/out:'+str(payload/'Zula-Loader.exe')]+[str(root/name) for name in LOADER_SOURCES],check=True,capture_output=True)
+def pinned_game_rows(raw):
+    document=json.loads(raw)
+    if document.get('version')!=1 or document.get('kind')!='audited-static-game-payload':raise ValueError('Invalid game manifest')
+    rows=document.get('files')
+    if not isinstance(rows,list) or not 1<=len(rows)<=512:raise ValueError('Game file count outside bound')
+    seen=set()
+    for row in rows:
+        name=safe_name(row['path']);key=name.casefold()
+        if key in seen or not isinstance(row.get('size'),int) or not 0<row['size']<=1024*1024*1024 or not re.fullmatch('[0-9a-f]{64}',row.get('sha256','')):raise ValueError('Invalid game payload row')
+        seen.add(key)
+        vendor_key=name=='ANet.key' and row['size']==80 and row['sha256']==ANET_VENDOR_KEY_SHA256
+        if any(part in ('gpucache','logs','battleye','__pycache__') for part in key.split('/')) or any(value in key for value in ('.zbak','.orig','acklog','remote-client','private','id_ed25519')) or key.endswith(('.log','.ini')) or (key.endswith('.key') and not vendor_key):
+            raise ValueError('Private or mutable game file is not allowed')
+    if not {'zula.exe','acknex.dll','anet.dll','libcurl.dll','zula.wdl'}<=seen:raise ValueError('Incomplete game manifest')
+    return rows
+def stream_hash(file,limit=8*1024*1024*1024):
+    before=ordinary(file)
+    if before.st_size>limit:raise ValueError('File exceeds bound')
+    digest=hashlib.sha256();size=0
+    with file.open('rb') as source:
+        while chunk:=source.read(1024*1024):digest.update(chunk);size+=len(chunk)
+    after=ordinary(file)
+    if (before.st_ino,before.st_size,before.st_mtime_ns)!=(after.st_ino,after.st_size,after.st_mtime_ns) or size!=before.st_size:raise ValueError('File changed during hash')
+    return size,digest.hexdigest()
+def copy_game(game,payload,rows):
+    for row in rows:
+        source=source_file(game,row['path']);before=ordinary(source)
+        if before.st_size!=row['size']:raise ValueError('Game source size changed: '+row['path'])
+        target=payload/'Game'/row['path'];target.parent.mkdir(parents=True,exist_ok=True)
+        digest=hashlib.sha256();size=0
+        with source.open('rb') as incoming,target.open('xb') as output:
+            while chunk:=incoming.read(1024*1024):
+                size+=len(chunk)
+                if size>row['size']:raise ValueError('Game source grew')
+                output.write(chunk);digest.update(chunk)
+        after=ordinary(source)
+        if (before.st_ino,before.st_size,before.st_mtime_ns)!=(after.st_ino,after.st_size,after.st_mtime_ns) or size!=row['size'] or digest.hexdigest()!=row['sha256']:raise ValueError('Game source pin changed: '+row['path'])
+def build(root,stage,cache,*,fetch=False,compile_setup=False,include_game=False,game_directory=DEFAULT_GAME,backend_release=None,single_file=False,client_update=None):
+    root=root.resolve(strict=True);stage=stage.absolute()
+    if stage.exists():raise ValueError('Use a new empty build directory; existing output is never overwritten')
+                                                                        
+    if stage==root or root.is_relative_to(stage):raise ValueError('Invalid build directory')
+    if backend_release is not None and not re.fullmatch('[0-9a-f]{64}',backend_release):raise ValueError('Backend release must be the exact SHA256')
+    if backend_release is not None and not include_game:raise ValueError('The tester release contains the complete game')
+    if backend_release is not None and not single_file:raise ValueError('The tester release must be a single EXE')
+    snapshots={name:read(source_file(root,name)) for name in (*SOURCES,*MAPPED,*COMPILER_INPUTS)}
+    files=payload_sources(root)
+    signed=signed_client_payload(client_update) if client_update is not None else None
+    if signed is not None and not (include_game and single_file and backend_release):raise ValueError('Signed client seed requires the complete single-file tester release')
+    game_rows=[]
+    if include_game:
+        snapshots['installer/game_payload.json']=read(source_file(root,'installer/game_payload.json'))
+        game_rows=pinned_game_rows(snapshots['installer/game_payload.json'])
+    runtime=json.loads(snapshots['installer/runtime_sources.json'])
+    prerequisite=json.loads(snapshots['installer/prerequisites.json'])
+    if prerequisite.get('version')!=1 or prerequisite.get('file')!='vcredist-2008-sp1-KB2538243-x86.exe' or prerequisite.get('sha256')!='8742bcbf24ef328a72d2a27b693cc7071e38d3bb4b9b44dec42aa3d2c8d61d92':raise ValueError('Unsupported native prerequisite')
+    files['runtime/redist/'+prerequisite['file']]=runtime_package(prerequisite,cache,fetch)
+    if runtime.get('version')!=1 or runtime.get('platform')!='win32-x64' or [x['name'] for x in runtime['packages']]!=['node','python','frida']:raise ValueError('Unsupported runtime manifest')
+    for row in runtime['packages']:
+        raw=runtime_package(row,cache,fetch)
+        if row['name']=='node':
+            prefix='node-v24.15.0-win-x64/';selected=[prefix+'node.exe',prefix+'LICENSE']
+            for name,data in archive_members(raw,selected).items():files['runtime/node/'+name[len(prefix):]]=data
+        elif row['name']=='python':
+            for name,data in archive_members(raw,PYTHON_FILES,exact=True).items():files['runtime/python/'+name]=data
+        else:
+            for name,data in archive_members(raw,FRIDA_FILES,exact=True).items():files['runtime/python/site-packages/'+name]=data
+    files['runtime/python/python313._pth']=b'python313.zip\n.\nsite-packages\n../../tools\n'
+    stage.mkdir(parents=True);payload=stage/'payload';payload.mkdir()
+    emit_files(files,payload)
+    if signed is None:compile_loader(root,payload)
+    else:(payload/'Zula-Loader.exe').write_bytes(signed['Zula-Loader.exe'])
+    copy_game(game_directory.resolve(strict=True),payload,game_rows)
+    rows=[]
+    for file in sorted(payload.rglob('*')):
+        if file.is_file():
+            size,digest=stream_hash(file);rows.append({'path':str(file.relative_to(payload)).replace('\\','/'),'size':size,'sha256':digest})
+    rows.sort(key=lambda row:row['path'])
+    expected=set(files)|{'Zula-Loader.exe'}|{'Game/'+row['path'] for row in game_rows}
+    validate_client_paths(expected)
+    if {row['path'] for row in rows}!=expected:raise ValueError('Unexpected generated payload member')
+    document={'version':1,'kind':'test-client-release' if backend_release else 'test-client-preview','platform':'win32-x64',
+        'backendReleaseSha256':backend_release,'verification':{'native1v1':False},
+        'includesGame':include_game,'distributionLayout':'single-exe' if single_file else 'disk-spanning',
+        'entryPoint':'Zula-Loader.exe',
+        'sourceInputs':[{'path':name,'sha256':sha(raw)} for name,raw in sorted(snapshots.items())],
+        'runtimes':runtime['packages'],'nativePrerequisite':prerequisite,'files':rows,'totalBytes':sum(row['size'] for row in rows)}
+    if signed is not None:
+        installed_raw=signed['client-payload-manifest.json']
+        installed=json.loads(installed_raw)
+        if installed.get('files')!=rows or installed.get('totalBytes')!=document['totalBytes']:raise ValueError('Full setup bytes differ from the signed client inventory')
+        if any(installed.get(key)!=document[key] for key in ('version','kind','platform','includesGame','distributionLayout','entryPoint')):raise ValueError('Signed client setup contract mismatch')
+    else:
+        installed_raw=(json.dumps(public_client_manifest(document),indent=2,ensure_ascii=False)+'\n').encode('utf-8')
+    document['installedManifest']={'path':'client-payload-manifest.json','size':len(installed_raw),'sha256':sha(installed_raw)}
+    manifest=(json.dumps(document,indent=2,ensure_ascii=False)+'\n').encode('utf-8');(stage/'build-manifest.json').write_bytes(manifest)
+    (payload/'client-payload-manifest.json').write_bytes(installed_raw)
+    listing=stage/'payload-files.iss'
+    lines=[]
+    for name in sorted(expected|{'client-payload-manifest.json'}):
+        parent=str(PurePosixPath(name).parent);dest='{app}' if parent=='.' else '{app}\\'+parent.replace('/','\\')
+        flags='ignoreversion nocompression' if name.startswith('Game/') and not single_file else 'ignoreversion'
+        lines.append('Source: "'+str(payload/name)+'"; DestDir: "'+dest+'"; Flags: '+flags)
+    listing.write_text('\n'.join(lines)+'\n',encoding='utf-8-sig')
+    for name,raw in snapshots.items():
+        if read(source_file(root,name))!=raw:raise ValueError('Source changed during staging: '+name)
+    if compile_setup:
+        compiler=Path('C:/Program Files (x86)/Inno Setup 6/ISCC.exe')
+        distribution=stage/'distribution';distribution.mkdir()
+        build_name='Setup' if backend_release else 'Zula-Test-Full-Preview-Setup' if include_game else 'Zula-Test-Preview-Setup'
+        options=['/DIncludeGame=1'] if include_game else []
+        if single_file:options.append('/DSingleFile=1')
+        subprocess.run([str(compiler),'/Qp','/DPayloadDir='+str(payload),'/DPayloadList='+str(listing),
+            '/DOutputPath='+str(distribution),'/DBuildName='+build_name,*options,str(root/'installer/ZulaTest.iss')],check=True)
+        for name,raw in snapshots.items():
+            if read(source_file(root,name))!=raw:raise ValueError('Source changed during compilation: '+name)
+        parts=[]
+        for file in sorted(distribution.iterdir()):
+            size,digest=stream_hash(file);parts.append({'file':file.name,'size':size,'sha256':digest})
+        if single_file and (len(parts)!=1 or not parts[0]['file'].endswith('.exe') or parts[0]['size']>=4200000000):raise ValueError('Single EXE limit or output contract failed')
+        record=stage/'setup-sha256.json' if single_file else distribution/'SHA256.json'
+        record.write_text(json.dumps({'files':parts,'manifestSha256':sha(manifest),'backendReleaseSha256':backend_release,'verification':{'native1v1':False}},indent=2)+'\n')
+    return document
+def main():
+    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--stage',type=Path,required=True)
+    parser.add_argument('--cache',type=Path,default=ROOT/'installer/cache');parser.add_argument('--fetch-runtimes',action='store_true');parser.add_argument('--compile',action='store_true')
+    parser.add_argument('--include-game',action='store_true');parser.add_argument('--game-directory',type=Path,default=DEFAULT_GAME)
+    parser.add_argument('--single-file',action='store_true',help='Solid-compress the exact payload into one supported Inno EXE')
+    parser.add_argument('--backend-release',help='Exact deployed backend SHA256; selects the final test-client filename/manifest')
+    parser.add_argument('--client-update',type=Path,help='Exact signed feed directory used as the current client seed; no loader recompilation')
+    args=parser.parse_args();result=build(ROOT,args.stage,args.cache,fetch=args.fetch_runtimes,compile_setup=args.compile,include_game=args.include_game,game_directory=args.game_directory,backend_release=args.backend_release,single_file=args.single_file,client_update=args.client_update)
+    print(json.dumps({'stage':str(args.stage.absolute()),'files':len(result['files']),'bytes':result['totalBytes'],'kind':result['kind']}))
+if __name__=='__main__':main()
